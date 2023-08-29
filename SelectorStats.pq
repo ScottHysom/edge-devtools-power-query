@@ -4,36 +4,67 @@
  */
 let
     /*
-     * Selects a single row in `sourceTable` that has an event name that matches one of `eventNames`, which might not 
-     * necessarily be the first row in the table that meets the condition. 
+     * Performs a binary search on `sortedList`, returning the index of `findValue` or null if not found.
      *
-     * We can't use Table.FirstN because that function stops the moment a row doesn't meet the condition, which means 
-     * it can return no rows, even if a row further down does meet the condition.
+     * Callers should use this instead of List.Contains for very large lists because List.Contains performs 
+     * a linear search.
+     *
+     * This function uses List.Generate instead of a recursive approach because Power Query does not perform
+     * tail call optimization which can result in stack overflows.
      */
-    SelectSingleRowAsRecord = (sourceTable as table, eventNames as list) as record =>
+    BinarySearch = (sortedList as list, findValue as number) as nullable number =>
         let
-            // Avoid Table.SelectRows with expensive conditions (like List.Contains) because `sourceTable` can be O(5).
-            // Instead, accumulate based on the shorter `eventNames` list and succeed out early when the first row
-            // is found.
-            InitialState = [SingleRecord = null, FoundFirstRow = false],
-            ResolveState = (state as record, currentName as text) as record =>
-                let
-                    MatchedRows = Table.SelectRows(sourceTable, each [name] = currentName),
-                    FoundRow = Table.RowCount(MatchedRows) > 0,
-                    SingleRecord = if FoundRow then Table.First(MatchedRows) else state[SingleRecord]
-                in
-                    [SingleRecord = SingleRecord, FoundFirstRow = FoundRow],
-            FinalState = List.Accumulate(
-                eventNames,
-                InitialState,
-                (state as record, currentName as text) =>
-                    if state[FoundFirstRow] then
-                        state
+            MinIndex = 0,
+            MaxIndex = List.Count(sortedList) - 1,
+            Result = List.Generate(
+                /* Initial */ () =>
+                    [
+                        Iterations = 0,
+                        FindValue = findValue,
+                        MinIndex = MinIndex,
+                        MaxIndex = MaxIndex,
+                        MidIndex = Number.IntegerDivide(MinIndex + MaxIndex, 2)
+                    ],
+                /* Condition */ each
+                    [MinIndex] <= [MaxIndex],
+                /* Next */ each
+                    if sortedList{[MidIndex]} < findValue then
+                        [
+                            Iterations = [Iterations] + 1,
+                            MinIndex = [MidIndex] + 1,
+                            MaxIndex = [MaxIndex],
+                            MidIndex = Number.IntegerDivide([MidIndex] + 1 + [MaxIndex], 2),
+                            FindValue = findValue
+                        ]
+                    else if sortedList{[MidIndex]} > findValue then
+                        [
+                            Iterations = [Iterations] + 1,
+                            MinIndex = [MinIndex],
+                            MaxIndex = [MidIndex] - 1,
+                            MidIndex = Number.IntegerDivide([MinIndex] + [MidIndex] - 1, 2),
+                            FindValue = findValue
+                        ]
                     else
-                        ResolveState(state, currentName)
-            )
+                        [
+                            Iterations = [Iterations],
+                            MinIndex = [MidIndex] + 1,
+                            MaxIndex = [MidIndex] - 1,
+                            MidIndex = [MidIndex],
+                            FindValue = findValue
+                        ],
+                /* Selector */ each
+                    [
+                        Iterations = [Iterations],
+                        MinIndex = [MinIndex],
+                        MaxIndex = [MaxIndex],
+                        MidIndex = [MidIndex],
+                        FindValue = [FindValue],
+                    ]
+            ),
+            LastRecord = List.Last(Result, null),
+            FoundIndex = try if sortedList{LastRecord[MidIndex]} = findValue then LastRecord[MidIndex] else null otherwise null
         in
-            FinalState[SingleRecord],
+            FoundIndex,
     /*
      * Expands the `sourceTable` so the basic trace event fields are available.
      */
@@ -59,23 +90,20 @@ let
                 TraceEventsAsRecords,
                 "traceEvents",
                 {"args", "cat", "dur", "name", "ph", "pid", "tdur", "s", "tid", "ts", "tts"}
-            ),
-            MetadataRowsRemoved = Table.SelectRows(TraceEventsExpanded, each [cat] <> "__metadata")
+            )
         in
-            MetadataRowsRemoved,
+            TraceEventsExpanded,
     /*
-     * Determines the main render thread ID based on the first 'StyleRecalcInvalidationTracking' event.
+     * Returns a list of render thread IDs.
      */
-    GetMainRenderThreadId = (sourceTable as table) as number =>
+    GetRenderThreadIds = (sourceTable as table) as list =>
         let
-            MainRenderThreadRecord = SelectSingleRowAsRecord(sourceTable, {"StyleRecalcInvalidationTracking"}),
-            MainRenderThreadId =
-                if MainRenderThreadRecord <> null then
-                    MainRenderThreadRecord[tid]
-                else
-                    error "No main render thread found"
+            ThreadRows = Table.SelectRows(sourceTable, each [name] = "thread_name"),
+            WithThreadName = Table.ExpandRecordColumn(ThreadRows, "args", {"name"}, {"ThreadName"}),
+            RenderThreadRows = Table.SelectRows(WithThreadName, each [ThreadName] = "CrRendererMain"),
+            ThreadIds = List.Sort(RenderThreadRows[tid])
         in
-            MainRenderThreadId,
+            ThreadIds,
     /*
      * Gets the starting timestamp.
      */
@@ -89,6 +117,31 @@ let
                     error "The first event does not have a timestamp"
         in
             StartTimestamp,
+    /*
+     * Adds a 'Recalc Style Iteration' column, which increments only for the Recalc Style events.
+     */
+    AddRecalcStyleIterationColumn = (sourceTable as table) =>
+        let
+            ColumnNames = Table.ColumnNames(sourceTable),
+            EventNames = sourceTable[name],
+            NewColumn = List.Generate(
+                () => [RecalcStyleIteration = if EventNames{0} = "UpdateLayoutTree" then 1 else 0, i = 0],
+                each [i] < Table.RowCount(sourceTable),
+                each
+                    [
+                        RecalcStyleIteration = if EventNames{[i] + 1} = "UpdateLayoutTree" then
+                            [RecalcStyleIteration] + 1
+                        else
+                            [RecalcStyleIteration],
+                        i = [i] + 1
+                    ],
+                each [RecalcStyleIteration]
+            ),
+            FinalTable = Table.FromColumns(
+                Table.ToColumns(sourceTable) & {NewColumn}, ColumnNames & {"Recalc Style Iteration"}
+            )
+        in
+            FinalTable,
     /*
      * Expands the `args` record into the desired set of columns.
      */
@@ -190,21 +243,20 @@ let
     // Read and transform file
     SourceAsRecords = Json.Document(File.Contents(InputFilePath)),
     SourceAsTable = Table.FromRecords({SourceAsRecords}),
-    BasicTraceEvents = GetBasicTraceEvents(SourceAsTable),
+    TableBuffered = Table.Buffer(SourceAsTable),
+    BasicTraceEvents = GetBasicTraceEvents(TableBuffered),
     // Filter to just the events on the render threads
-    MainRenderThreadId = GetMainRenderThreadId(BasicTraceEvents),
-    RenderThreadEvents = Table.SelectRows(BasicTraceEvents, each [tid] = MainRenderThreadId),
+    RenderThreadIds = GetRenderThreadIds(BasicTraceEvents),
+    RenderThreadEvents = Table.SelectRows(BasicTraceEvents, each BinarySearch(RenderThreadIds, [tid]) <> null),
     ThreadStartTimestamp = GetStartTimestamp(RenderThreadEvents),
-    // Filter to just the SelectorStats events
-    SelectorStatsEvents = Table.SelectRows(BasicTraceEvents, each [name] = "SelectorStats"),
+    // Filter to just the Recalc Styles and SelectorStats events. We will eventually reduce this to just SelectorStats
+    // but we need the Recalc Styles to calculate the Recalc Style Iteration column.
+    InitialEvents = Table.SelectRows(BasicTraceEvents, each [name] = "UpdateLayoutTree" or [name] = "SelectorStats"),
+    RecalcStyleIterationAdded = AddRecalcStyleIterationColumn(InitialEvents),
+    SelectorStatsEvents = Table.SelectRows(RecalcStyleIterationAdded, each [name] = "SelectorStats"),
     // Add pre-expansion columns
-    ActivityAdded = Table.AddColumn(
-        SelectorStatsEvents, "Activity", each if [name] = "SelectorStats" then "Selector Stats" else [name]
-    ),
-    RecalcStyleIterationAdded = Table.AddIndexColumn(ActivityAdded, "Recalc Style Iteration", 1),
-    StartTimeAdded = Table.AddColumn(
-        RecalcStyleIterationAdded, "Start Time (ms)", each ([ts] - ThreadStartTimestamp) / 1000
-    ),
+    ActivityAdded = Table.AddColumn(SelectorStatsEvents, "Activity", each [name]),
+    StartTimeAdded = Table.AddColumn(ActivityAdded, "Start Time (ms)", each ([ts] - ThreadStartTimestamp) / 1000),
     // Expand columns that have records
     ArgsExpanded = ExpandArgs(StartTimeAdded),
     // Add post-expansion columns
