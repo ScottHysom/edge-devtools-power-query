@@ -108,6 +108,21 @@ let
                 in
                     FinalTable,
             /*
+             * Adds a key column that makes the row unique.
+             */
+            AddKeyColumns = (sourceTable as table) as table =>
+                let
+                    KeyAdded = Table.AddColumn(
+                        sourceTable, "Key", each Text.Combine({Number.ToText([ts]), Number.ToText([tid])}, "-")
+                    ),
+                    IterationKeyAdded = Table.AddColumn(
+                        KeyAdded,
+                        "Iteration Key",
+                        each Text.Combine({Number.ToText([tid]), Number.ToText([Recalc Style Iteration])}, "-")
+                    )
+                in
+                    IterationKeyAdded,
+            /*
              * Builds a table of events for the thread `threadId`.
              */
             GetEventsForThread = (sourceTable as table, threadId as number)/*as table*/ =>
@@ -123,9 +138,11 @@ let
                     SelectorStatsEvents = Table.SelectRows(RecalcStyleIterationAdded, each [name] = "SelectorStats"),
                     StartTimeAdded = Table.AddColumn(
                         SelectorStatsEvents, "Start Time (ms)", each ([ts] - ThreadStartTimestamp) / 1000
-                    )
+                    ),
+                    ActivityAdded = Table.AddColumn(StartTimeAdded, "Activity", each [name]),
+                    KeysAdded = AddKeyColumns(ActivityAdded)
                 in
-                    StartTimeAdded,
+                    KeysAdded,
             /*
              * Returns a table of events for all the render threads.
              */
@@ -150,21 +167,6 @@ let
                     TablesCombined = Table.Combine(FinalState[Tables])
                 in
                     TablesCombined,
-            /*
-             * Adds a key column that makes the row unique.
-             */
-            AddKeyColumns = (sourceTable as table) as table =>
-                let
-                    KeyAdded = Table.AddColumn(
-                        sourceTable, "Key", each Text.Combine({Number.ToText([ts]), Number.ToText([tid])}, "-")
-                    ),
-                    IterationKeyAdded = Table.AddColumn(
-                        KeyAdded,
-                        "Iteration Key",
-                        each Text.Combine({Number.ToText([tid]), Number.ToText([Recalc Style Iteration])}, "-")
-                    )
-                in
-                    IterationKeyAdded,
             /*
              * Expands the `args` record into the desired set of columns.
              */
@@ -299,10 +301,8 @@ let
             // Filter to just the events on the render threads
             RenderThreadIds = GetRenderThreadIds(UnrelatedEventsRemoved),
             RenderThreadEvents = GetRenderThreadEvents(UnrelatedEventsRemoved, RenderThreadIds),
-            // Add pre-expansion columns
-            ActivityAdded = Table.AddColumn(RenderThreadEvents, "Activity", each [name]),
             // Expand columns that have records
-            ArgsExpanded = ExpandArgs(ActivityAdded),
+            ArgsExpanded = ExpandArgs(RenderThreadEvents),
             // Add post-expansion columns
             SlowRejectCountAdded = Table.AddColumn(
                 ArgsExpanded, "Slow Reject Count", each [Match Attempts] - [Match Count] - [Fast Reject Count]
@@ -310,9 +310,8 @@ let
             RejectCountAdded = Table.AddColumn(
                 SlowRejectCountAdded, "Reject Count", each [Match Attempts] - [Match Count]
             ),
-            KeysAdded = AddKeyColumns(RejectCountAdded),
             // Remove, re-order and assign types to columns
-            ColumnsRemoved = Table.RemoveColumns(KeysAdded, {"metadata"}),
+            ColumnsRemoved = Table.RemoveColumns(RejectCountAdded, {"metadata"}),
             ColumnsRenamed = Table.RenameColumns(ColumnsRemoved, {{"tid", "Thread ID"}}),
             ColumnsReordered = Table.ReorderColumns(
                 ColumnsRenamed,
