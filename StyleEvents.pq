@@ -3,520 +3,601 @@
  * events found in the profile.
  */
 let
-    /*
-     * Selects a single row in `sourceTable` that has an event name that matches one of `eventNames`, which might not 
-     * necessarily be the first row in the table that meets the condition. 
-     *
-     * We can't use Table.FirstN because that function stops the moment a row doesn't meet the condition, which means 
-     * it can return no rows, even if a row further down does meet the condition.
-     */
-    SelectSingleRowAsRecord = (sourceTable as table, eventNames as list) as record =>
+    StyleEvents =
         let
-            // Avoid Table.SelectRows with expensive conditions (like List.Contains) because `sourceTable` can be O(5).
-            // Instead, accumulate based on the shorter `eventNames` list and succeed out early when the first row
-            // is found.
-            InitialState = [SingleRecord = null, FoundFirstRow = false],
-            ResolveState = (state as record, currentName as text) =>
+            /*
+             * Removes events that we don't care about. `filter` can be "keep-more" or "keep-less".
+             */
+            RemoveUnrelatedEvents = (sourceTable as table, filter as text) as table =>
                 let
-                    MatchedRows = Table.SelectRows(sourceTable, each [name] = currentName),
-                    FoundRow = Table.RowCount(MatchedRows) > 0,
-                    SingleRecord = if FoundRow then Table.First(MatchedRows) else state[SingleRecord]
-                in
-                    [SingleRecord = SingleRecord, FoundFirstRow = FoundRow],
-            FinalState = List.Accumulate(
-                eventNames,
-                InitialState,
-                (state as record, currentName as text) =>
-                    if state[FoundFirstRow] then
-                        state
-                    else
-                        ResolveState(state, currentName)
-            )
-        in
-            FinalState[SingleRecord],
-    /*
-     * Expands the `sourceTable` so the basic trace event fields are available.
-     */
-    GetBasicTraceEvents = (sourceTable as table) as table =>
-        let
-            TraceEventsAsRecords = Table.ExpandListColumn(sourceTable, "traceEvents"),
-            /* Basic `traceEvents` schema:
-                {
-                    "args": { ... },
-                    "cat":"<text>",
-                    "dur":<number>,
-                    "name":"<text>",
-                    "ph":"<text>",
-                    "pid":<number>,
-                    "tdur":<number>,
-                    "s": "<text>",
-                    "tid":<number>,
-                    "ts":<number>,
-                    "tts":<number>
-                }
-            */
-            TraceEventsExpanded = Table.ExpandRecordColumn(
-                TraceEventsAsRecords,
-                "traceEvents",
-                {"args", "cat", "dur", "name", "ph", "pid", "tdur", "s", "tid", "ts", "tts"}
-            ),
-            MetadataRowsRemoved = Table.SelectRows(TraceEventsExpanded, each [cat] <> "__metadata")
-        in
-            MetadataRowsRemoved,
-    /*
-     * Determines the main render thread ID based on the first 'StyleRecalcInvalidationTracking' event.
-     */
-    GetMainRenderThreadId = (sourceTable as table) as number =>
-        let
-            MainRenderThreadRecord = SelectSingleRowAsRecord(sourceTable, {"StyleRecalcInvalidationTracking"}),
-            MainRenderThreadId =
-                if MainRenderThreadRecord <> null then
-                    MainRenderThreadRecord[tid]
-                else
-                    error "No main render thread found"
-        in
-            MainRenderThreadId,
-    /*
-     * Removes events that we don't care about.
-     */
-    RemoveUnrelatedEvents = (sourceTable as table) as table =>
-        let
-            CategoriesRemoved = Table.SelectRows(
-                sourceTable,
-                each
-                    // Retain these events...
-                    // Selector Stats
-                    ([cat] = "disabled-by-default-blink.debug" and [name] = "SelectorStats")
-                    // Schedule Style Recalculation
-                    or ([cat] = "disabled-by-default-devtools.timeline" and [name] = "ScheduleStyleRecalculation")
-                    // Layout, prepaint
-                    or ([cat] = "devtools.timeline" and ([name] = "Layout" or [name] = "ParseHTML"))
-                    // 'UpdateLayoutTree' is the "Recalculate Style" activity with the Total Time value
-                    or ([cat] = "blink,devtools.timeline" and [name] = "UpdateLayoutTree")
-                    // Custom perf markers
-                    or [cat] = "blink.user_timing"
-                    // Discard these events...
-                    or (
-                        // Profile metadata (threads, processes)
-                        [cat] <> "__metadata"
-                        // Loading events
-                        and [cat] <> "loading"
-                        // V8 events
-                        and [cat] <> "v8"
-                        and [cat] <> "v8.execute"
-                        and [cat] <> "v8,devtools.timeline"
-                        and [cat] <> "devtools.timeline,v8"
-                        and [cat] <> "devtools.timeline,disabled-by-default-v8.gc"
-                        and [cat] <> "disabled-by-default-v8.compile"
-                        and [cat] <> "disabled-by-default-v8.cpu_profiler"
-                        // Timers, function calls, event dispatching, layout, prepaint
-                        and [cat] <> "devtools.timeline"
-                        // Paint
-                        and [cat] <> "devtools.timeline,rail"
-                        // RunTask, InvalidatedLayout, ScheduleStyleRecalculation
-                        and [cat] <> "disabled-by-default-devtools.timeline"
-                        // EventDispatcher, LocalFrameView, SelectorStats, UpdateCounters, UpdateLayer
-                        and [cat] <> "disabled-by-default-blink.debug"
-                        // Frame-related
-                        and [cat] <> "disabled-by-default-devtools.timeline.frame"
-                        // Intersection observers, HitTest, UpdateLayoutTree
-                        and [cat] <> "blink,devtools.timeline"
-                        // Invalidation tracking includes style events, but VERY noisy
-                        and [cat] <> "disabled-by-default-devtools.timeline.invalidationTracking"
-                        // Screen snapshots
-                        and [cat] <> "disabled-by-default-cc.debug.display_items,disabled-by-default-cc.debug.picture,disabled-by-default-devtools.timeline.picture"
-                        // Animations
-                        and [cat] <> "blink.animations,devtools.timeline,benchmark,rail"
-                        // and [cat] <> "input,benchmark,devtools.timeline,latencyInfo"
-                        // and [cat] <> "cc,disabled-by-default-devtools.timeline"
+                    FilterLevel =
+                        if filter = "keep-more" then
+                            "keep-more"
+                        else if filter = "keep-less" then
+                            "keep-less"
+                        else
+                            error "filter argument is invalid",
+                    Rows = Table.SelectRows(
+                        sourceTable,
+                        each
+                            // Retain initial metadata...
+                            (FilterLevel = "keep-more" and [name] = "thread_name")
+                            // Retain typical thread-starting events so we can calculate event start times...
+                            or (
+                                FilterLevel = "keep-more"
+                                and (
+                                    [cat] = "loading"
+                                    or [name] = "RunTask"
+                                    or [name] = "BeginFrame"
+                                    or [name] = "TracingSessionIdForWorker"
+                                    or [name] = "navigationStart"
+                                )
+                            )
+                            // Retain these events...
+                            // Selector Stats
+                            or [name] = "SelectorStats"
+                            // 'UpdateLayoutTree' is the "Recalculate Style" activity with the Total Time value
+                            or [name] = "UpdateLayoutTree"
+                            // Schedule Style Recalculation
+                            or [name] = "ScheduleStyleRecalculation"
+                            // Layout, prepaint
+                            or ([name] = "Layout" or [name] = "LayoutShift" or [name] = "ParseHTML")
+                            // Custom perf markers
+                            or [cat] = "blink.user_timing"
                     )
-            )
-        in
-            CategoriesRemoved,
-    /*
-     * Gets the starting timestamp.
-     */
-    GetStartTimestamp = (sourceTable as table) as number =>
-        let
-            FirstRecord = Table.First(sourceTable),
-            StartTimestamp =
-                if FirstRecord[ts] <> 0 then
-                    FirstRecord[ts]
-                else
-                    error "The first event does not have a timestamp"
-        in
-            StartTimestamp,
-    /*
-     * Adds an 'Activity' column, which maps event names to friendlier Dev Tools UI equivalent activities
-     */
-    AddActivityColumn = (sourceTable as table) as table =>
-        let
-            ColumnAdded = Table.AddColumn(
-                sourceTable,
-                "Activity",
-                each
-                    if [name] = "ScheduleStyleRecalculation" then
-                        "Schedule Style Recalculation"
-                    else if [name] = "UpdateLayoutTree" then
-                        "Recalculate Style"
-                    else if [cat] = "blink.user_timing" then
-                        Text.Combine({"Perf Marker:", [name]})
-                    else
-                        [name]
-            )
-        in
-            ColumnAdded,
-    /*
-     * Expands the selector stats into columns.
-     */
-    ExpandSelectorStats = (sourceTable as table) as table =>
-        let
-            SelectorTimingsExpandedAsRecords = Table.ExpandListColumn(sourceTable, "selector_timings"),
-            SelectorTimingsExpanded = Table.ExpandRecordColumn(
-                SelectorTimingsExpandedAsRecords,
-                "selector_timings",
-                {"elapsed (us)", "fast_reject_count", "match_attempts", "match_count", "selector", "style_sheet_id"},
-                {"Elapsed", "Fast Reject Count", "Match Attempts", "Match Count", "Selector", "Style Sheet ID"}
-            ),
-            SlowRejectCountAdded = Table.AddColumn(
-                SelectorTimingsExpanded, "Slow Reject Count", each [Match Attempts] - [Fast Reject Count]
-            )
-        in
-            SlowRejectCountAdded,
-    /*
-     * Returns a dictionary (as a record) whose field names are keys to the records in `records`.
-     */
-    ToDictionary = (records as list, key as text) as record =>
-        List.Accumulate(
-            records,
-            [],
-            (accumRecord, current) => Record.AddField(accumRecord, Text.From(Record.Field(current, key)), current)
-        ),
-    /*
-     * Returns a record as a dictionary, whose property names are keys (using the timestamp) to nested aggregate 
-     * records. The aggregate record contains the selector stats in aggregate for the selector stat that occurred at 
-     * that timestamp.
-     */
-    BuildSelectorStatsAggregates = (sourceTable as table) as record =>
-        let
-            SelectorStatsRows = Table.SelectRows(sourceTable, each [name] = "SelectorStats"),
-            SelectorStatsExpanded = ExpandSelectorStats(SelectorStatsRows),
-            SelectorStatsAggregatedByTimestamp = Table.Group(
-                SelectorStatsExpanded,
-                "ts",
-                {
-                    {"Elapsed (us)", each List.Sum([Elapsed])},
-                    {"Fast Reject Count", each List.Sum([Fast Reject Count])},
-                    {"Slow Reject Count", each List.Sum([Slow Reject Count])},
-                    {"Match Attempts", each List.Sum([Match Attempts])},
-                    {"Match Count", each List.Sum([Match Count])},
-                    {"Selector Count", each List.Count([Selector])}
-                }
-            ),
-            SelectorStatsRecords = Table.ToRecords(SelectorStatsAggregatedByTimestamp),
-            SelectorStatsDictionary = ToDictionary(SelectorStatsRecords, "ts")
-        in
-            SelectorStatsDictionary,
-    /*
-     * Adds columns related to selector stats.
-     */
-    AddSelectorStatsColumns = (sourceTable as table) as table =>
-        let
-            SelectorStatsDictionary = BuildSelectorStatsAggregates(sourceTable),
-            ElapsedTotalAdded = Table.AddColumn(
-                sourceTable,
-                "Elapsed (us)",
-                each
-                    if [name] = "SelectorStats" then
-                        Record.Field(SelectorStatsDictionary, Number.ToText([ts]))[#"Elapsed (us)"]
-                    else
-                        null
-            ),
-            FastRejectCountAdded = Table.AddColumn(
-                ElapsedTotalAdded,
-                "Fast Reject Count",
-                each
-                    if [name] = "SelectorStats" then
-                        Record.Field(SelectorStatsDictionary, Number.ToText([ts]))[Fast Reject Count]
-                    else
-                        null
-            ),
-            SlowRejectCountAdded = Table.AddColumn(
-                FastRejectCountAdded,
-                "Slow Reject Count",
-                each
-                    if [name] = "SelectorStats" then
-                        Record.Field(SelectorStatsDictionary, Number.ToText([ts]))[Slow Reject Count]
-                    else
-                        null
-            ),
-            MatchAttemptsAdded = Table.AddColumn(
-                SlowRejectCountAdded,
-                "Match Attempts",
-                each
-                    if [name] = "SelectorStats" then
-                        Record.Field(SelectorStatsDictionary, Number.ToText([ts]))[Match Attempts]
-                    else
-                        null
-            ),
-            MatchCountAdded = Table.AddColumn(
-                MatchAttemptsAdded,
-                "Match Count",
-                each
-                    if [name] = "SelectorStats" then
-                        Record.Field(SelectorStatsDictionary, Number.ToText([ts]))[Match Count]
-                    else
-                        null
-            ),
-            SelectorCountAdded = Table.AddColumn(
-                MatchCountAdded,
-                "Selector Count",
-                each
-                    if [name] = "SelectorStats" then
-                        Record.Field(SelectorStatsDictionary, Number.ToText([ts]))[Selector Count]
-                    else
-                        null
-            )
-        in
-            SelectorCountAdded,
-    /*
-     * Expands the `args` record into the desired set of columns.
-     */
-    ExpandArgs = (sourceTable as table) as table =>
-        let
-            ArgsExpanded = Table.ExpandRecordColumn(
-                sourceTable,
-                "args",
-                {
-                // `UpdateLayoutTree` properties
-                "elementCount",
-                // `StyleRecalcInvalidationTracking` properties
-                "data",
-                // `SelectorStats` properties
-                "selector_stats"},
-                {"Element Count", "data", "selector_stats"}
-            ),
-            /* The `UpdateLayoutTree` event schema:
-                {
-                    "args": {
-                        "beginData": {
-                            "frame":"<text>"            // <--- we don't use
-                        },
-                        "elementCount":<number>         // <--- we want this
-                    },
-                    "cat":"blink,devtools.timeline",
-                    "dur":<number>,
-                    "name":"UpdateLayoutTree",
-                    "ph":"<text>",
-                    "pid":<number>,
-                    "tdur":<number>,
-                    "tid":<number>,
-                    "ts":<number>,
-                    "tts":<number>
-                }
-            */
-            /* The `StyleRecalcInvalidationTracking` event schema:
-                {
-                    "args": {
-                        "data": {
-                            "extraData": "<text>",
-                            "frame":"<text>",           // <--- we don't use
-                            "invalidationList": [
-                                { 
-                                    "classes": ["<text>", ...],
-                                    "id": "<text>"
-                                },
-                                ...
-                            ],
-                            "nodeId": <number>,
-                            "nodeName": "<text>",
-                            "reason": "<text>",
-                            "subtree": <logical>
-                        }
-                    },
-                    "cat": "disabled-by-default-devtools.timeline.invalidationTracking",
-                    "name": "StyleInvalidatorInvalidationTracking",
-                    "ph": "<text>",
-                    "pid": <number>,
-                    "s": "<text>",
-                    "tid": <number>,
-                    "ts": <number>,
-                    "tts": <number>
-                }
-            */
-            DataExpanded = Table.ExpandRecordColumn(
-                ArgsExpanded,
-                "data",
-                {"extraData", "nodeId", "nodeName", "reason", "subtree"},
-                {"Extra Data", "Node Id", "Node Name", "Reason", "Subtree"}
-            ),
-            /* The `SelectorStats` event schema:
-                {
-                    "args": {
-                        "selector_stats": {
-                            "selector_timings": [
-                                {
-                                    "elapsed (us)": <number>,
-                                    "fast_reject_count": <number>,
-                                    "match_attempts": <number>,
-                                    "match_count": <number>,
-                                    "selector": "<text>",
-                                    "style_sheet_id":"<text>"
-                                },
-                                ...
-                            ]
-                        }
-                    },
-                    "cat": "disabled-by-default-blink.debug",
-                    "dur": <number>,
-                    "name": "SelectorStats",
-                    "ph": "<text>",
-                    "pid": <number>,
-                    "tdur": <number>,
-                    "tid": <number>,
-                    "ts": <number>,
-                    "tts": <number>
-                }
-            */
-            SelectorStatsExpanded = Table.ExpandRecordColumn(
-                DataExpanded, "selector_stats", {"selector_timings"}, {"selector_timings"}
-            )
-        in
-            SelectorStatsExpanded,
-    /* 
-     * Returns the configuration value of `parameterName` from the configuration table `configTableName`.
-     */
-    GetConfigValue = (
-        configTableName as text, parameterName as text, optional defaultValue as any, optional coerceType as type
-    ) =>
-        let
-            GetParameterValue = (row as record, parameterName as text, defaultValue as any, parameterType as type) =>
-                let
-                    TextValue = row[Value],
-                    RawValue = Value.FromText(TextValue),
-                    CoercedValue =
-                        try Value.As(RawValue, parameterType) otherwise Value.As(defaultValue, parameterType),
-                    TrimmedValue = if Type.Is(parameterType, type text) then Text.Trim(CoercedValue) else CoercedValue
                 in
-                    TrimmedValue,
-            // ------------
-            Type = if coerceType <> null then coerceType else type text,
-            HasDefaultValue = defaultValue <> null,
-            ConfigTable = Excel.CurrentWorkbook(){[Name = configTableName]}[Content],
-            ParameterRows = Table.SelectRows(ConfigTable, each [Parameter] = parameterName),
-            Value =
-                if Table.RowCount(ParameterRows) > 0 then
-                    GetParameterValue(ParameterRows{0}, parameterName, defaultValue, Type)
-                else if HasDefaultValue then
-                    defaultValue
-                else
-                    error
-                        "Configuration parameter '"
-                            & parameterName
-                            & "' not found in the '"
-                            & configTableName
-                            & "' table."
+                    Rows,
+            /*
+             * Expands the `sourceTable` so the basic trace event fields are available.
+             */
+            GetBasicTraceEvents = (sourceTable as table) as table =>
+                let
+                    TraceEventsAsRecords = Table.ExpandListColumn(sourceTable, "traceEvents"),
+                    /* Basic `traceEvents` schema:
+                        {
+                            "args": { ... },
+                            "cat":"<text>",
+                            "dur":<number>,
+                            "name":"<text>",
+                            "ph":"<text>",
+                            "pid":<number>,
+                            "tdur":<number>,
+                            "s": "<text>",
+                            "tid":<number>,
+                            "ts":<number>,
+                            "tts":<number>
+                        }
+                    */
+                    TraceEventsExpanded = Table.ExpandRecordColumn(
+                        TraceEventsAsRecords,
+                        "traceEvents",
+                        {"args", "cat", "dur", "name", "ph", "pid", "tdur", "s", "tid", "ts", "tts"}
+                    )
+                in
+                    TraceEventsExpanded,
+            /*
+             * Gets the starting timestamp.
+             */
+            GetStartTimestamp = (sourceTable as table) as number =>
+                let
+                    FirstRecord = Table.First(sourceTable),
+                    StartTimestamp =
+                        if FirstRecord[ts] <> 0 then
+                            FirstRecord[ts]
+                        else
+                            error "The first event does not have a timestamp"
+                in
+                    StartTimestamp,
+            /*
+             * Returns a list of render thread IDs.
+             */
+            GetRenderThreadIds = (sourceTable as table) as list =>
+                let
+                    ThreadRows = Table.SelectRows(sourceTable, each [name] = "thread_name"),
+                    WithThreadName = Table.ExpandRecordColumn(ThreadRows, "args", {"name"}, {"ThreadName"}),
+                    RenderThreadRows = Table.SelectRows(WithThreadName, each [ThreadName] = "CrRendererMain"),
+                    ThreadIds = List.Sort(RenderThreadRows[tid])
+                in
+                    ThreadIds,
+            /*
+             * Adds a 'Recalc Style Iteration' column, which increments only for the Recalc Style events.
+             */
+            AddRecalcStyleIterationColumn = (sourceTable as table) =>
+                let
+                    SourceBuffered = Table.Buffer(sourceTable),
+                    ColumnNames = Table.ColumnNames(SourceBuffered),
+                    EventNames = SourceBuffered[name],
+                    RowCount = Table.RowCount(SourceBuffered),
+                    IterationColumn = List.Generate(
+                        () => [RecalcStyleIteration = if EventNames{0} = "UpdateLayoutTree" then 1 else 0, RowIndex = 0],
+                        each [RowIndex] < RowCount,
+                        each
+                            [
+                                RecalcStyleIteration = if EventNames{[RowIndex] + 1} = "UpdateLayoutTree" then
+                                    [RecalcStyleIteration] + 1
+                                else
+                                    [RecalcStyleIteration],
+                                RowIndex = [RowIndex] + 1
+                            ],
+                        each [RecalcStyleIteration]
+                    ),
+                    FinalTable = Table.FromColumns(
+                        Table.ToColumns(SourceBuffered) & {IterationColumn}, ColumnNames & {"Recalc Style Iteration"}
+                    )
+                in
+                    FinalTable,
+            /*
+             * Adds an 'Activity' column, which maps event names to friendlier Dev Tools UI equivalent activities
+             */
+            AddActivityColumn = (sourceTable as table) as table =>
+                let
+                    ColumnAdded = Table.AddColumn(
+                        sourceTable,
+                        "Activity",
+                        each
+                            if [name] = "UpdateLayoutTree" then
+                                "RecalculateStyle"
+                            else if [cat] = "blink.user_timing" then
+                                Text.Combine({"Perf Marker: ", [name]})
+                            else
+                                [name]
+                    )
+                in
+                    ColumnAdded,
+            /*
+             * Adds a key column that makes the row unique.
+             */
+            AddKeyColumns = (sourceTable as table) as table =>
+                let
+                    KeyAdded = Table.AddColumn(
+                        sourceTable, "Key", each Text.Combine({Number.ToText([ts]), Number.ToText([tid])}, "-")
+                    ),
+                    IterationKeyAdded = Table.AddColumn(
+                        KeyAdded,
+                        "Iteration Key",
+                        each Text.Combine({Number.ToText([tid]), Number.ToText([Recalc Style Iteration])}, "-")
+                    )
+                in
+                    IterationKeyAdded,
+            /*
+             * Builds a table of events for the thread `threadId`.
+             */
+            GetEventsForThread = (sourceTable as table, threadId as number)/*as table*/ =>
+                let
+                    ThreadEvents = Table.SelectRows(sourceTable, each [tid] = threadId and [name] <> "thread_name"),
+                    ThreadStartTimestamp = GetStartTimestamp(ThreadEvents),
+                    ScopedThreadEvents = RemoveUnrelatedEvents(ThreadEvents, "keep-less"),
+                    ScopedEventsSorted = Table.Sort(ScopedThreadEvents, {"ts"}),
+                    StartTimeAdded = Table.AddColumn(
+                        ScopedEventsSorted, "Start Time (ms)", each List.Max({[ts] - ThreadStartTimestamp, 0}) / 1000
+                    ),
+                    RecalcStyleIterationAdded = AddRecalcStyleIterationColumn(StartTimeAdded),
+                    TotalTimeAdded = Table.AddColumn(
+                        RecalcStyleIterationAdded, "Total Time (ms)", each if [dur] <> null then [dur] / 1000 else null
+                    ),
+                    ActivityAdded = AddActivityColumn(TotalTimeAdded),
+                    KeysAdded = AddKeyColumns(ActivityAdded)
+                in
+                    KeysAdded,
+            /*
+             * Returns a table of events for all the render threads.
+             */
+            GetRenderThreadEvents = (sourceTable as table, renderThreadIds as list) as table =>
+                let
+                    FinalState = List.Accumulate(
+                        /* List */ renderThreadIds,
+                        /* Seed */ [
+                            Tables = {}
+                        ],
+                        /* Accumulator */ (
+                            state, threadId
+                        ) =>
+                            let
+                                ThreadTable = GetEventsForThread(sourceTable, threadId),
+                                NewState = [
+                                    Tables = List.Combine({state[Tables], {ThreadTable}})
+                                ]
+                            in
+                                NewState
+                    ),
+                    TablesCombined = Table.Combine(FinalState[Tables])
+                in
+                    TablesCombined,
+            /*
+             * Expands the selector stats into columns.
+             */
+            ExpandSelectorStats = (sourceTable as table) as table =>
+                let
+                    SelectorTimingsExpandedAsRecords = Table.ExpandListColumn(sourceTable, "selector_timings"),
+                    SelectorTimingsExpanded = Table.ExpandRecordColumn(
+                        SelectorTimingsExpandedAsRecords,
+                        "selector_timings",
+                        {
+                            "elapsed (us)",
+                            "fast_reject_count",
+                            "match_attempts",
+                            "match_count",
+                            "selector",
+                            "style_sheet_id"
+                        },
+                        {
+                            "Elapsed",
+                            "Fast Reject Count",
+                            "Match Attempts",
+                            "Match Count",
+                            "Selector",
+                            "Style Sheet ID"
+                        }
+                    ),
+                    SlowRejectCountAdded = Table.AddColumn(
+                        SelectorTimingsExpanded,
+                        "Slow Reject Count",
+                        each [Match Attempts] - [Match Count] - [Fast Reject Count]
+                    ),
+                    RejectCountAdded = Table.AddColumn(
+                        SlowRejectCountAdded, "Reject Count", each [Match Attempts] - [Match Count]
+                    )
+                in
+                    RejectCountAdded,
+            /*
+             * Returns a dictionary (as a record) whose field names are keys to the records in `records`.
+             */
+            ToDictionary = (records as list, key as text) as record =>
+                List.Accumulate(
+                    records,
+                    [],
+                    (accumRecord, current) =>
+                        Record.AddField(accumRecord, Text.From(Record.Field(current, key)), current)
+                ),
+            /*
+             * Returns a record as a dictionary, whose property names are keys to nested aggregate 
+             * records. The aggregate record contains the selector stats in aggregate for the selector stat that 
+             * occurred at that key.
+             */
+            BuildSelectorStatsAggregates = (sourceTable as table) as record =>
+                let
+                    SelectorStatsRows = Table.SelectRows(sourceTable, each [name] = "SelectorStats"),
+                    SelectorStatsExpanded = ExpandSelectorStats(SelectorStatsRows),
+                    SelectorStatsAggregatedByTimestamp = Table.Group(
+                        SelectorStatsExpanded,
+                        "Key",
+                        {
+                            {"Elapsed (us)", each List.Sum([Elapsed])},
+                            {"Match Attempts", each List.Sum([Match Attempts])},
+                            {"Match Count", each List.Sum([Match Count])},
+                            {"Reject Count", each List.Sum([Reject Count])},
+                            {"Fast Reject Count", each List.Sum([Fast Reject Count])},
+                            {"Slow Reject Count", each List.Sum([Slow Reject Count])},
+                            {"Selector Count", each List.Count([Selector])}
+                        }
+                    ),
+                    SelectorStatsRecords = Table.ToRecords(SelectorStatsAggregatedByTimestamp),
+                    SelectorStatsDictionary = ToDictionary(SelectorStatsRecords, "Key")
+                in
+                    SelectorStatsDictionary,
+            /*
+             * Adds columns related to selector stats.
+             */
+            AddSelectorStatsColumns = (sourceTable as table) as table =>
+                let
+                    SelectorStatsDictionary = BuildSelectorStatsAggregates(sourceTable),
+                    ElapsedTotalAdded = Table.AddColumn(
+                        sourceTable,
+                        "Elapsed (us)",
+                        each
+                            if [name] = "SelectorStats" then
+                                Record.Field(SelectorStatsDictionary, [Key])[#"Elapsed (us)"]
+                            else
+                                null
+                    ),
+                    MatchAttemptsAdded = Table.AddColumn(
+                        ElapsedTotalAdded,
+                        "Match Attempts",
+                        each
+                            if [name] = "SelectorStats" then
+                                Record.Field(SelectorStatsDictionary, [Key])[Match Attempts]
+                            else
+                                null
+                    ),
+                    MatchCountAdded = Table.AddColumn(
+                        MatchAttemptsAdded,
+                        "Match Count",
+                        each
+                            if [name] = "SelectorStats" then
+                                Record.Field(SelectorStatsDictionary, [Key])[Match Count]
+                            else
+                                null
+                    ),
+                    RejectCountAdded = Table.AddColumn(
+                        MatchCountAdded,
+                        "Reject Count",
+                        each
+                            if [name] = "SelectorStats" then
+                                Record.Field(SelectorStatsDictionary, [Key])[Reject Count]
+                            else
+                                null
+                    ),
+                    FastRejectCountAdded = Table.AddColumn(
+                        RejectCountAdded,
+                        "Fast Reject Count",
+                        each
+                            if [name] = "SelectorStats" then
+                                Record.Field(SelectorStatsDictionary, [Key])[Fast Reject Count]
+                            else
+                                null
+                    ),
+                    SlowRejectCountAdded = Table.AddColumn(
+                        FastRejectCountAdded,
+                        "Slow Reject Count",
+                        each
+                            if [name] = "SelectorStats" then
+                                Record.Field(SelectorStatsDictionary, [Key])[Slow Reject Count]
+                            else
+                                null
+                    ),
+                    SelectorCountAdded = Table.AddColumn(
+                        SlowRejectCountAdded,
+                        "Selector Count",
+                        each
+                            if [name] = "SelectorStats" then
+                                Record.Field(SelectorStatsDictionary, [Key])[Selector Count]
+                            else
+                                null
+                    )
+                in
+                    SelectorCountAdded,
+            /*
+             * Expands the `args` record into the desired set of columns.
+             */
+            ExpandArgs = (sourceTable as table) as table =>
+                let
+                    ArgsExpanded = Table.ExpandRecordColumn(
+                        sourceTable,
+                        "args",
+                        {
+                        // `UpdateLayoutTree` properties
+                        "elementCount",
+                        // `StyleRecalcInvalidationTracking` properties
+                        "data",
+                        // `SelectorStats` properties
+                        "selector_stats"},
+                        {"Element Count", "data", "selector_stats"}
+                    ),
+                    /* The `UpdateLayoutTree` event schema:
+                        {
+                            "args": {
+                                "beginData": {
+                                    "frame":"<text>"            // <--- we don't use
+                                },
+                                "elementCount":<number>         // <--- we want this
+                            },
+                            "cat":"blink,devtools.timeline",
+                            "dur":<number>,
+                            "name":"UpdateLayoutTree",
+                            "ph":"<text>",
+                            "pid":<number>,
+                            "tdur":<number>,
+                            "tid":<number>,
+                            "ts":<number>,
+                            "tts":<number>
+                        }
+                    */
+                    /* The `StyleRecalcInvalidationTracking` event schema:
+                        {
+                            "args": {
+                                "data": {
+                                    "extraData": "<text>",
+                                    "frame":"<text>",           // <--- we don't use
+                                    "invalidationList": [
+                                        { 
+                                            "classes": ["<text>", ...],
+                                            "id": "<text>"
+                                        },
+                                        ...
+                                    ],
+                                    "nodeId": <number>,
+                                    "nodeName": "<text>",
+                                    "reason": "<text>",
+                                    "subtree": <logical>
+                                }
+                            },
+                            "cat": "disabled-by-default-devtools.timeline.invalidationTracking",
+                            "name": "StyleInvalidatorInvalidationTracking",
+                            "ph": "<text>",
+                            "pid": <number>,
+                            "s": "<text>",
+                            "tid": <number>,
+                            "ts": <number>,
+                            "tts": <number>
+                        }
+                    */
+                    DataExpanded = Table.ExpandRecordColumn(
+                        ArgsExpanded,
+                        "data",
+                        {"extraData", "nodeId", "nodeName", "reason", "subtree"},
+                        {"Extra Data", "Node Id", "Node Name", "Reason", "Subtree"}
+                    ),
+                    /* The `SelectorStats` event schema:
+                        {
+                            "args": {
+                                "selector_stats": {
+                                    "selector_timings": [
+                                        {
+                                            "elapsed (us)": <number>,
+                                            "fast_reject_count": <number>,
+                                            "match_attempts": <number>,
+                                            "match_count": <number>,
+                                            "selector": "<text>",
+                                            "style_sheet_id":"<text>"
+                                        },
+                                        ...
+                                    ]
+                                }
+                            },
+                            "cat": "disabled-by-default-blink.debug",
+                            "dur": <number>,
+                            "name": "SelectorStats",
+                            "ph": "<text>",
+                            "pid": <number>,
+                            "tdur": <number>,
+                            "tid": <number>,
+                            "ts": <number>,
+                            "tts": <number>
+                        }
+                    */
+                    SelectorStatsExpanded = Table.ExpandRecordColumn(
+                        DataExpanded, "selector_stats", {"selector_timings"}, {"selector_timings"}
+                    )
+                in
+                    SelectorStatsExpanded,
+            /* 
+             * Returns the configuration value of `parameterName` from the configuration table `configTableName`.
+             */
+            GetConfigValue = (
+                configTableName as text,
+                parameterName as text,
+                optional defaultValue as any,
+                optional coerceType as type
+            ) =>
+                let
+                    GetParameterValue = (
+                        row as record, parameterName as text, defaultValue as any, parameterType as type
+                    ) =>
+                        let
+                            TextValue = row[Value],
+                            RawValue = Value.FromText(TextValue),
+                            CoercedValue =
+                                try
+                                    Value.As(RawValue, parameterType) otherwise Value.As(defaultValue, parameterType),
+                            TrimmedValue =
+                                if Type.Is(parameterType, type text) then
+                                    Text.Trim(CoercedValue)
+                                else
+                                    CoercedValue
+                        in
+                            TrimmedValue,
+                    // ------------
+                    Type = if coerceType <> null then coerceType else type text,
+                    HasDefaultValue = defaultValue <> null,
+                    ConfigTable = Excel.CurrentWorkbook(){[Name = configTableName]}[Content],
+                    ParameterRows = Table.SelectRows(ConfigTable, each [Parameter] = parameterName),
+                    Value =
+                        if Table.RowCount(ParameterRows) > 0 then
+                            GetParameterValue(ParameterRows{0}, parameterName, defaultValue, Type)
+                        else if HasDefaultValue then
+                            defaultValue
+                        else
+                            error
+                                "Configuration parameter '"
+                                    & parameterName
+                                    & "' not found in the '"
+                                    & configTableName
+                                    & "' table."
+                in
+                    Value,
+            /*
+             * Remove any surrounding quotes from the config value
+             */
+            GetFilePathConfigValue = (configTableName as text, parameterName as text) =>
+                let
+                    TextWithMaybeQuotes = GetConfigValue(configTableName, parameterName),
+                    // Remove any surrounding quotes
+                    RemoveQuotes = Text.Remove(TextWithMaybeQuotes, {""""})
+                in
+                    RemoveQuotes,
+            /*
+             ***************************************************************************************
+             * Main
+             ***************************************************************************************
+             */
+            // Parameters to use
+            InputFilePath = GetFilePathConfigValue("Config", "InputFilePath"),
+            // Read and transform file
+            SourceAsRecords = Json.Document(File.Contents(InputFilePath)),
+            SourceAsTable = Table.FromRecords({SourceAsRecords}),
+            BasicTraceEvents = GetBasicTraceEvents(SourceAsTable),
+            UnrelatedEventsRemoved = RemoveUnrelatedEvents(BasicTraceEvents, "keep-more"),
+            // Filter to just the events on the render threads
+            RenderThreadIds = GetRenderThreadIds(UnrelatedEventsRemoved),
+            RenderThreadEvents = GetRenderThreadEvents(UnrelatedEventsRemoved, RenderThreadIds),
+            // Expand columns that have records
+            ArgsExpanded = ExpandArgs(RenderThreadEvents),
+            // Add post-expansion columns
+            SelectorStatsAdded = AddSelectorStatsColumns(ArgsExpanded),
+            // Remove, re-order and assign types to columns
+            ColumnsRemoved = Table.RemoveColumns(SelectorStatsAdded, {"metadata", "selector_timings"}),
+            ColumnsRenamed = Table.RenameColumns(ColumnsRemoved, {{"tid", "Thread ID"}}),
+            ColumnsReordered = Table.ReorderColumns(
+                ColumnsRenamed,
+                {
+                    "Thread ID",
+                    "Start Time (ms)",
+                    "Activity",
+                    "Total Time (ms)",
+                    "Recalc Style Iteration",
+                    "Element Count",
+                    "Elapsed (us)",
+                    "Match Attempts",
+                    "Match Count",
+                    "Reject Count",
+                    "Fast Reject Count",
+                    "Slow Reject Count",
+                    "Selector Count",
+                    "Extra Data",
+                    "Node Id",
+                    "Node Name",
+                    "Reason",
+                    "Subtree",
+                    "dur",
+                    "tdur",
+                    "ph",
+                    "pid",
+                    "s",
+                    "ts",
+                    "tts",
+                    "name",
+                    "cat",
+                    "Key",
+                    "Iteration Key"
+                }
+            ),
+            TypesChanged = Table.TransformColumnTypes(
+                ColumnsReordered,
+                {
+                    {"Thread ID", Int64.Type},
+                    {"Start Time (ms)", type number},
+                    {"Activity", type text},
+                    {"Total Time (ms)", type number},
+                    {"Recalc Style Iteration", type number},
+                    {"Element Count", type number},
+                    {"Elapsed (us)", type number},
+                    {"Match Attempts", type number},
+                    {"Match Count", type number},
+                    {"Reject Count", type number},
+                    {"Fast Reject Count", type number},
+                    {"Slow Reject Count", type number},
+                    {"Selector Count", type number},
+                    {"Extra Data", type any},
+                    {"Node Id", Int64.Type},
+                    {"Node Name", type text},
+                    {"Reason", type text},
+                    {"Subtree", type logical},
+                    {"dur", Int64.Type},
+                    {"tdur", Int64.Type},
+                    {"ph", type text},
+                    {"pid", Int64.Type},
+                    {"s", type text},
+                    {"ts", Int64.Type},
+                    {"tts", Int64.Type},
+                    {"name", type text},
+                    {"cat", type text},
+                    {"Key", type text},
+                    {"Iteration Key", type text}
+                }
+            ),
+            ColumnsSorted = Table.Sort(TypesChanged, {"Thread ID", "ts"}),
+            FinalColumns = ColumnsSorted
         in
-            Value,
-    /*
-     * Remove any surrounding quotes from the config value
-     */
-    GetFilePathConfigValue = (configTableName as text, parameterName as text) =>
-        let
-            TextWithMaybeQuotes = GetConfigValue(configTableName, parameterName),
-            // Remove any surrounding quotes
-            RemoveQuotes = Text.Remove(TextWithMaybeQuotes, {""""})
-        in
-            RemoveQuotes,
-    /*
-     ***************************************************************************************
-     * Main
-     ***************************************************************************************
-     */
-    // Parameters to use
-    InputFilePath = GetFilePathConfigValue("Config", "InputFilePath"),
-    // Read and transform file
-    SourceAsRecords = Json.Document(File.Contents(InputFilePath)),
-    SourceAsTable = Table.FromRecords({SourceAsRecords}),
-    BasicTraceEvents = GetBasicTraceEvents(SourceAsTable),
-    // Filter to just the events on the render threads
-    MainRenderThreadId = GetMainRenderThreadId(BasicTraceEvents),
-    RenderThreadEvents = Table.SelectRows(BasicTraceEvents, each [tid] = MainRenderThreadId),
-    ThreadStartTimestamp = GetStartTimestamp(RenderThreadEvents),
-    UnrelatedEventsRemoved = RemoveUnrelatedEvents(RenderThreadEvents),
-    // Add pre-expansion columns
-    ActivityAdded = AddActivityColumn(UnrelatedEventsRemoved),
-    StartTimeAdded = Table.AddColumn(ActivityAdded, "Start Time (ms)", each ([ts] - ThreadStartTimestamp) / 1000),
-    TotalTimeColumnAdded = Table.AddColumn(
-        StartTimeAdded, "Total Time (ms)", each if [dur] <> null then [dur] / 1000 else null
-    ),
-    // Expand columns that have records
-    ArgsExpanded = ExpandArgs(TotalTimeColumnAdded),
-    // Add post-expansion columns
-    SelectorStatsAdded = AddSelectorStatsColumns(ArgsExpanded),
-    // Remove, re-order and assign types to columns
-    ColumnsRemoved = Table.RemoveColumns(SelectorStatsAdded, {"metadata", "selector_timings"}),
-    ColumnsReordered = Table.ReorderColumns(
-        ColumnsRemoved,
-        {
-            "Start Time (ms)",
-            "Activity",
-            "Total Time (ms)",
-            "Element Count",
-            "Elapsed (us)",
-            "Fast Reject Count",
-            "Slow Reject Count",
-            "Match Attempts",
-            "Match Count",
-            "Selector Count",
-            "Extra Data",
-            "Node Id",
-            "Node Name",
-            "Reason",
-            "Subtree",
-            "dur",
-            "tdur",
-            "ph",
-            "pid",
-            "tid",
-            "s",
-            "ts",
-            "tts",
-            "name",
-            "cat"
-        }
-    ),
-    TypesChanged = Table.TransformColumnTypes(
-        ColumnsReordered,
-        {
-            {"Start Time (ms)", type number},
-            {"Activity", type text},
-            {"Total Time (ms)", type number},
-            {"Element Count", type number},
-            {"Elapsed (us)", type number},
-            {"Fast Reject Count", type number},
-            {"Slow Reject Count", type number},
-            {"Match Attempts", type number},
-            {"Match Count", type number},
-            {"Selector Count", type number},
-            {"Extra Data", type any},
-            {"Node Id", Int64.Type},
-            {"Node Name", type text},
-            {"Reason", type text},
-            {"Subtree", type logical},
-            {"dur", Int64.Type},
-            {"tdur", Int64.Type},
-            {"ph", type text},
-            {"pid", Int64.Type},
-            {"tid", Int64.Type},
-            {"s", type text},
-            {"ts", Int64.Type},
-            {"tts", Int64.Type},
-            {"name", type text},
-            {"cat", type text}
-        }
-    ),
-    ColumnsSorted = Table.Sort(TypesChanged, {"ts"}),
-    FinalColumns = ColumnsSorted
+            FinalColumns
 in
-    FinalColumns
+    StyleEvents
