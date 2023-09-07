@@ -168,6 +168,42 @@ let
                 in
                     TablesCombined,
             /*
+             * Expands the selector stats into columns.
+             */
+            ExpandSelectorTimings = (sourceTable as table) as table =>
+                let
+                    SelectorTimingsExpandedAsRecords = Table.ExpandListColumn(sourceTable, "selector_timings"),
+                    SelectorTimingsExpanded = Table.ExpandRecordColumn(
+                        SelectorTimingsExpandedAsRecords,
+                        "selector_timings",
+                        {
+                            "elapsed (us)",
+                            "fast_reject_count",
+                            "match_attempts",
+                            "match_count",
+                            "selector",
+                            "style_sheet_id"
+                        },
+                        {
+                            "Elapsed (us)",
+                            "Fast Reject Count",
+                            "Match Attempts",
+                            "Match Count",
+                            "Selector",
+                            "Style Sheet ID"
+                        }
+                    ),
+                    SlowRejectCountAdded = Table.AddColumn(
+                        SelectorTimingsExpanded,
+                        "Slow Reject Count",
+                        each [Match Attempts] - [Match Count] - [Fast Reject Count]
+                    ),
+                    RejectCountAdded = Table.AddColumn(
+                        SlowRejectCountAdded, "Reject Count", each [Match Attempts] - [Match Count]
+                    )
+                in
+                    RejectCountAdded,
+            /*
              * Expands the `args` record into the desired set of columns.
              */
             ExpandArgs = (sourceTable as table) as table =>
@@ -206,29 +242,7 @@ let
                     SelectorStatsExpanded = Table.ExpandRecordColumn(
                         ArgsExpanded, "selector_stats", {"selector_timings"}, {"selector_timings"}
                     ),
-                    SelectorTimingsExpandedAsRecords = Table.ExpandListColumn(
-                        SelectorStatsExpanded, "selector_timings"
-                    ),
-                    SelectorTimingsExpanded = Table.ExpandRecordColumn(
-                        SelectorTimingsExpandedAsRecords,
-                        "selector_timings",
-                        {
-                            "elapsed (us)",
-                            "fast_reject_count",
-                            "match_attempts",
-                            "match_count",
-                            "selector",
-                            "style_sheet_id"
-                        },
-                        {
-                            "Elapsed (us)",
-                            "Fast Reject Count",
-                            "Match Attempts",
-                            "Match Count",
-                            "Selector",
-                            "Style Sheet ID"
-                        }
-                    )
+                    SelectorTimingsExpanded = ExpandSelectorTimings(SelectorStatsExpanded)
                 in
                     SelectorTimingsExpanded,
             /* 
@@ -303,15 +317,8 @@ let
             RenderThreadEvents = GetRenderThreadEvents(UnrelatedEventsRemoved, RenderThreadIds),
             // Expand columns that have records
             ArgsExpanded = ExpandArgs(RenderThreadEvents),
-            // Add post-expansion columns
-            SlowRejectCountAdded = Table.AddColumn(
-                ArgsExpanded, "Slow Reject Count", each [Match Attempts] - [Match Count] - [Fast Reject Count]
-            ),
-            RejectCountAdded = Table.AddColumn(
-                SlowRejectCountAdded, "Reject Count", each [Match Attempts] - [Match Count]
-            ),
             // Remove, re-order and assign types to columns
-            ColumnsRemoved = Table.RemoveColumns(RejectCountAdded, {"metadata"}),
+            ColumnsRemoved = Table.RemoveColumns(ArgsExpanded, {"metadata"}),
             ColumnsRenamed = Table.RenameColumns(ColumnsRemoved, {{"tid", "Thread ID"}}),
             ColumnsReordered = Table.ReorderColumns(
                 ColumnsRenamed,

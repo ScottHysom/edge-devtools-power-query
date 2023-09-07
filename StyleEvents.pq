@@ -206,7 +206,7 @@ let
             /*
              * Expands the selector stats into columns.
              */
-            ExpandSelectorStats = (sourceTable as table) as table =>
+            ExpandSelectorTimings = (sourceTable as table) as table =>
                 let
                     SelectorTimingsExpandedAsRecords = Table.ExpandListColumn(sourceTable, "selector_timings"),
                     SelectorTimingsExpanded = Table.ExpandRecordColumn(
@@ -257,7 +257,7 @@ let
             BuildSelectorStatsAggregates = (sourceTable as table) as record =>
                 let
                     SelectorStatsRows = Table.SelectRows(sourceTable, each [name] = "SelectorStats"),
-                    SelectorStatsExpanded = ExpandSelectorStats(SelectorStatsRows),
+                    SelectorStatsExpanded = ExpandSelectorTimings(SelectorStatsRows),
                     SelectorStatsAggregatedByTimestamp = Table.Group(
                         SelectorStatsExpanded,
                         "Key",
